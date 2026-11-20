@@ -7,6 +7,12 @@
   "content_scripts": [
     {
       "matches": ["https://raketa.dev/*"],
+      "js": ["classic-diffs.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://raketa.dev/*"],
       "css": ["tab-style.css"],
       "js": ["review-data.js", "panel-style.js", "content.js"],
       "run_at": "document_idle"

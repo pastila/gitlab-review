@@ -4,32 +4,33 @@
   const treeSelector = '[data-testid="file-tree-container"], .tree-list-holder';
   const listToggleSelector = '[data-testid="list-view-toggle"]';
   const versionParams = ["diff_id", "start_sha", "commit_id", "diff_head"];
+  const classicParams = ["only_context_commits", "expanded"];
+  const autoExpandLimit = 10;
+  const approvalLabels = {
+    approved: "Апрув получен",
+    pending: "Ждёт апрува",
+    empty: "Нет файлов",
+    optional: "Апрув не требуется",
+    satisfied: "GitLab закрыл правило без всех апрувов",
+    "no-rule": "Нет правила апрува для секции",
+    loading: "Загружаем апрувы…",
+    unavailable: "Статус апрува недоступен",
+  };
   let active;
 
   function yieldTask() {
     return globalThis.scheduler?.yield?.() ?? new Promise(resolve => setTimeout(resolve, 0));
   }
 
-  function afterPaint() {
-    if (document.hidden) return yieldTask();
-    return new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
-  }
-
-  async function forEachSlice(items, visit, signal, paintChanges = false) {
+  async function forEachSlice(items, visit, signal) {
     let deadline = performance.now() + 6;
-    let changes = 0;
     for (const item of items) {
       signal.throwIfAborted();
-      if (visit(item)) changes++;
-      if (paintChanges && changes >= 128) {
-        await afterPaint();
-        changes = 0;
-      } else if (performance.now() >= deadline) {
+      visit(item);
+      if (performance.now() >= deadline) {
         await yieldTask();
-      } else {
-        continue;
+        deadline = performance.now() + 6;
       }
-      deadline = performance.now() + 6;
     }
     signal.throwIfAborted();
   }
@@ -59,11 +60,25 @@
     return JSON.stringify([oldPath, newPath]);
   }
 
+  function classicWhitespace(url, current) {
+    // The Classic Vue app can change its whitespace preference without changing the page URL.
+    const entries = performance.getEntriesByType("resource");
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const { name, initiatorType } = entries[index];
+      if (initiatorType !== "xmlhttprequest" || name.split("?")[0] !== url.href) continue;
+      const params = new URL(name).searchParams;
+      const sameComparison = ["diff_id", "start_sha", "commit_id", ...classicParams]
+        .every(key => params.get(key) === current.get(key));
+      if (sameComparison && params.has("w")) return params.get("w");
+    }
+    return current.get("w");
+  }
+
   function metadataUrl(context, root, rapid) {
     const base = reviewData.mergeRequestPath(context);
     const endpoint = rapid ? "diff_files_metadata" : "diffs_metadata.json";
     const url = new URL(`${base}/${endpoint}`, location.origin);
-    if (!rapid) url.searchParams.set("diff_head", "true");
+    const current = new URLSearchParams(location.search);
 
     if (rapid) {
       const nativeEndpoint = readData(root.dataset.appData)?.diff_files_endpoint;
@@ -71,8 +86,15 @@
         const native = new URL(nativeEndpoint, location.origin);
         if (native.origin === url.origin && native.pathname === url.pathname) url.search = native.search;
       }
+    } else {
+      const whitespace = classicWhitespace(url, current);
+      url.searchParams.set("diff_head", "true");
+      url.searchParams.set("view", "inline");
+      if (whitespace !== null) url.searchParams.set("w", whitespace);
+      for (const key of classicParams) {
+        if (current.has(key)) url.searchParams.set(key, current.get(key));
+      }
     }
-    const current = new URLSearchParams(location.search);
     for (const key of versionParams) {
       if (current.has(key)) url.searchParams.set(key, current.get(key));
     }
@@ -89,22 +111,25 @@
         url.searchParams.set("old_path", file.oldPath);
         url.searchParams.set("new_path", file.newPath);
       }
+      url.hash = file.hash ?? "";
     } else if (file.hash) {
       url.searchParams.set("file", file.hash);
+      url.hash = `diff-content-${file.hash}`;
+    } else {
+      url.hash = "";
     }
-    url.hash = file.hash ?? "";
     return url;
   }
 
   function mountTree(browser, closedFolders, fileHref, openFile) {
     const host = element("div", "raketa-codeowners-tree");
     host.lang = "ru";
+    host.hidden = true;
     const shadow = host.attachShadow({ mode: "open" });
     shadow.adoptedStyleSheets = [ownerFilterStyle];
     const nav = element("nav", "file-tree");
     nav.setAttribute("aria-label", "Файлы выбранных секций CODEOWNERS");
     shadow.append(nav);
-    browser.setAttribute(treeAttribute, "");
     browser.append(host);
 
     let lastFiles;
@@ -141,9 +166,15 @@
       drawController?.abort();
       drawController = new AbortController();
       const signal = drawController.signal;
-      drawing = build(files, query, listMode, signal).catch(error => {
-        if (!signal.aborted) throw error;
-      });
+      drawing = build(files, query, listMode, signal)
+        .then(() => {
+          if (!host.hidden || signal.aborted) return;
+          host.hidden = false;
+          browser.setAttribute(treeAttribute, "");
+        })
+        .catch(error => {
+          if (!signal.aborted) throw error;
+        });
       return drawing;
     }
 
@@ -280,7 +311,7 @@
     status.setAttribute("role", "status");
     const retry = button("control", "Повторить");
     retry.hidden = true;
-    toolbar.append(picker, options, jump, status, retry);
+    toolbar.append(status, retry, jump, picker, options);
     shadow.append(toolbar);
 
     if (rapid) root.before(host);
@@ -288,7 +319,7 @@
 
     const storageKey = `codeowners-section:${context.project}`;
     const selected = new Set();
-    const cardsSelector = rapid ? "diff-file[data-file-data]" : ".diff-file[data-path][id]";
+    const cardsSelector = rapid ? "diff-file[data-file-data]" : ".diff-file[data-path]";
     const pagerSelector = '[data-testid="file-by-file-navigation"]';
     const nativeSelector = `${cardsSelector}, ${pagerSelector}`;
     const drawer = document.getElementById("js-drawer-container");
@@ -297,15 +328,21 @@
     const nativeNodes = new Set();
     const trees = new Map();
     const closedFolders = new Set();
+    const approvalOptions = new Map();
+    const loadingDiffs = new Map();
     let files = [];
     let visibleFiles = [];
     let jumpFiles;
     let sections = [];
     let filesByHash;
     let filesByPaths;
+    let filesByNewPath;
     let controller;
+    let approvalRequest;
     let filterController;
     let appliedSections = new Set();
+    let filesToExpand = new Set();
+    let classicFiltered = false;
     let frame;
     let treesDirty = false;
     let observing = false;
@@ -324,7 +361,7 @@
     function cardFile(card) {
       const known = filesByHash.get(card.id);
       if (known) return known;
-      if (!rapid) return null;
+      if (!rapid) return filesByNewPath.get(card.dataset.path);
       const data = readData(card.dataset.fileData);
       if (!data || typeof data.old_path !== "string" || typeof data.new_path !== "string") return null;
       const paths = { oldPath: data.old_path, newPath: data.new_path };
@@ -339,21 +376,43 @@
     }
 
     function setHidden(node, hidden) {
-      const changed = node.hasAttribute(hiddenAttribute) !== hidden;
-      if (changed) node.toggleAttribute(hiddenAttribute, hidden);
+      node.toggleAttribute(hiddenAttribute, hidden);
       if (hidden) hiddenNodes.add(node);
       else hiddenNodes.delete(node);
-      return changed;
+    }
+
+    function expandFile(card, file) {
+      if (!filesToExpand.has(file) || !root.contains(card)) return;
+      if (rapid) {
+        const details = card.querySelector("details[data-file-body]");
+        if (!details || !card.querySelector("diff-file-mounted:defined")) return;
+        filesToExpand.delete(file);
+        // The native details toggle updates GitLab's collapsed state without moving focus.
+        if (!details.open) details.open = true;
+        const load = details.querySelector('button[data-click="showChanges"]:enabled');
+        if (load) {
+          loadingDiffs.set(file, load);
+          load.click();
+        }
+      } else {
+        filesToExpand.delete(file);
+        card.querySelector(`
+          [data-testid="diff-file-warning"] button[data-testid="expand-button"]:enabled,
+          .js-file-title .file-header-content > button:enabled:has(.gl-animated-icon-off)
+        `)?.click();
+      }
     }
 
     function applyNodeVisibility(node) {
-      if (!appliedSections.size) return setHidden(node, false);
       if (node.matches(cardsSelector)) {
         const file = cardFile(node);
-        return setHidden(node, Boolean(file && !matches(file)));
+        const outsideSelection = Boolean(file && !matches(file));
+        setHidden(node, !classicFiltered && outsideSelection);
+        if (file && !outsideSelection) expandFile(node, file);
+        return;
       }
       // GitLab's one-file pager uses the complete list. The chooser uses the filtered list.
-      return setHidden(node, true);
+      setHidden(node, true);
     }
 
     function syncTrees() {
@@ -428,8 +487,26 @@
     const observer = new MutationObserver(scheduleVisibility);
     const observedChanges = {
       childList: true, subtree: true, attributes: true,
-      attributeFilter: ["data-file-data", "data-path", "aria-current"],
+      attributeFilter: rapid ? ["data-file-data", "aria-current"] : ["data-path", "id", "aria-current"],
     };
+    function onDiffFileMounted(event) {
+      const card = event.target;
+      if ((!filesToExpand.size && !loadingDiffs.size) || !card.matches(cardsSelector)) return;
+      const file = cardFile(card);
+      const load = loadingDiffs.get(file);
+      if (load && !load.isConnected) {
+        loadingDiffs.delete(file);
+        // GitLab focuses the replacement card synchronously after mounting it.
+        if (load.disabled && !card.inert) {
+          card.inert = true;
+          queueMicrotask(() => { card.inert = false; });
+        }
+      }
+      if (!filesToExpand.has(file)) return;
+      trackNode(card);
+      scheduleVisibility([]);
+    }
+
     function clearVisibility() {
       observer.disconnect();
       observing = false;
@@ -444,10 +521,8 @@
       trees.clear();
     }
 
-    async function applyVisibility(signal) {
+    function applyVisibility() {
       if (!appliedSections.size) {
-        await forEachSlice([...hiddenNodes], node => setHidden(node, false), signal, true);
-        signal.throwIfAborted();
         clearVisibility();
         return;
       }
@@ -459,7 +534,13 @@
           observer.observe(scope, observedChanges);
         }
       }
-      await forEachSlice([...nativeNodes], applyNodeVisibility, signal, true);
+      for (const node of nativeNodes) applyNodeVisibility(node);
+    }
+
+    function resetClassicFilter() {
+      if (!classicFiltered) return;
+      root.dispatchEvent(new Event("raketa-codeowners-reset-classic"));
+      classicFiltered = false;
     }
 
     function updatePicker() {
@@ -502,18 +583,25 @@
     }
 
     async function renderSelection(signal) {
-      await afterPaint();
       signal.throwIfAborted();
       appliedSections = new Set(selected);
       const nextFiles = appliedSections.size ? files.filter(matches) : files;
       if (visibleFiles.length !== nextFiles.length || nextFiles.some((file, index) => file !== visibleFiles[index])) {
         visibleFiles = nextFiles;
       }
-      await applyVisibility(signal);
-      signal.throwIfAborted();
-      if (appliedSections.size) await syncTrees();
-      signal.throwIfAborted();
-      await renderJump(signal);
+      if (appliedSections.size) {
+        filesToExpand = new Set(visibleFiles.slice(0, autoExpandLimit));
+        if (!rapid) {
+          const detail = visibleFiles.map(({ hash, newPath }) => ({ hash, newPath }));
+          classicFiltered = !root.dispatchEvent(new CustomEvent("raketa-codeowners-filter-classic", {
+            bubbles: true, cancelable: true, detail,
+          }));
+        }
+      } else {
+        resetClassicFilter();
+      }
+      applyVisibility();
+      await Promise.all([renderJump(signal), appliedSections.size ? syncTrees() : undefined]);
       signal.throwIfAborted();
 
       let message = "";
@@ -527,10 +615,11 @@
 
     function requestFilter() {
       filterController?.abort();
+      filesToExpand.clear();
       filterController = new AbortController();
       const signal = filterController.signal;
       updatePicker();
-      showStatus("Применяем фильтр…", true);
+      jump.disabled = true;
       void renderSelection(signal).catch(error => {
         if (!signal.aborted) showStatus(error instanceof Error ? error.message : "Не удалось применить фильтр.");
       });
@@ -542,6 +631,27 @@
       requestFilter();
     }
 
+    function setOptionApproval({ option, input, caption }, state) {
+      const label = approvalLabels[state];
+      option.dataset.approval = state;
+      option.title = label;
+      input.setAttribute("aria-label", `${caption} · ${label}`);
+    }
+
+    async function refreshApprovals() {
+      if (!ready || !approvalOptions.size) return;
+      const { signal } = controller;
+      if (approvalRequest === signal) return;
+      approvalRequest = signal;
+      for (const entry of approvalOptions.values()) setOptionApproval(entry, "loading");
+      const approvals = await reviewData.loadApprovals(context, signal).catch(() => null);
+      if (approvalRequest === signal) approvalRequest = undefined;
+      if (signal.aborted) return;
+      for (const [key, entry] of approvalOptions) {
+        setOptionApproval(entry, approvals ? approvals.get(key) ?? "no-rule" : "unavailable");
+      }
+    }
+
     async function renderOptions(preference, signal) {
       const saved = Array.isArray(preference) ? preference : [];
       if (typeof preference === "string" && preference.startsWith("section:")) saved.push(preference.slice("section:".length));
@@ -550,7 +660,9 @@
         for (const key of owners) counts.set(key, (counts.get(key) ?? 0) + 1);
       }
       reset.textContent = `Все файлы · ${files.length}`;
-      const labels = document.createDocumentFragment();
+      const labelsWithFiles = document.createDocumentFragment();
+      const labelsWithoutFiles = document.createDocumentFragment();
+      approvalOptions.clear();
       await forEachSlice(sections, ({ label, key }) => {
         const option = element("label", "option");
         const input = element("input");
@@ -558,12 +670,24 @@
         input.value = key;
         input.checked = saved.includes(key);
         if (input.checked) selected.add(key);
-        option.append(input, element("span", "", `${label} · ${counts.get(key) ?? 0}`));
-        labels.append(option);
+        const count = counts.get(key) ?? 0;
+        const caption = `${label} · ${count}`;
+        const marker = element("span", "approval-marker");
+        marker.setAttribute("aria-hidden", "true");
+        option.append(input, marker, element("span", "", caption));
+        const entry = { option, input, caption };
+        setOptionApproval(entry, count ? "loading" : "empty");
+        if (count) {
+          approvalOptions.set(key, entry);
+          labelsWithFiles.append(option);
+        } else {
+          labelsWithoutFiles.append(option);
+        }
       }, signal);
       signal.throwIfAborted();
       ready = true;
-      if (sections.length) options.replaceChildren(optionsStatus, reset, labels);
+      if (sections.length) options.replaceChildren(optionsStatus, reset, labelsWithFiles, labelsWithoutFiles);
+      if (options.matches(":popover-open")) void refreshApprovals();
       if (selected.size) requestFilter();
       else {
         updatePicker();
@@ -591,7 +715,8 @@
           files.push({ ...file, owners: reviewData.fileSections(file.oldPath, file.newPath, sections) });
         }, current.signal);
         filesByHash = new Map(files.filter(file => file.hash).map(file => [file.hash, file]));
-        filesByPaths = new Map(files.map(file => [pathsKey(file), file]));
+        if (rapid) filesByPaths = new Map(files.map(file => [pathsKey(file), file]));
+        else filesByNewPath = new Map(files.map(file => [file.newPath, file]));
         await renderOptions(stored[storageKey], current.signal);
       } catch (error) {
         if (current.signal.aborted) return;
@@ -606,6 +731,9 @@
       else selected.delete(input.value);
       saveSelection();
     });
+    options.addEventListener("toggle", event => {
+      if (event.newState === "open") void refreshApprovals();
+    });
     options.addEventListener("focusout", event => {
       const next = event.relatedTarget;
       if (next && next !== picker && !options.contains(next) && options.matches(":popover-open")) options.hidePopover();
@@ -617,16 +745,24 @@
       saveSelection();
     });
     async function openFile(file, browser = root) {
-      const card = file.hash && document.getElementById(file.hash);
-      const selector = `:is(a, button)[data-file-row="${CSS.escape(file.hash ?? "")}"]`;
-      const link = file.hash && browser.querySelector(selector);
-      if (link && (card || root.querySelector(pagerSelector))) {
+      const card = (file.hash && document.getElementById(file.hash))
+        || (!rapid && root.querySelector(`${cardsSelector}[data-path="${CSS.escape(file.newPath)}"]`));
+      const row = `[data-file-row="${CSS.escape(file.hash ?? "")}"]`;
+      const control = `:is(a, button)${row}`;
+      const link = file.hash && browser.querySelector(rapid ? control : `${control}, ${row} :is(a, button).file-row`);
+      const pager = root.querySelector(pagerSelector);
+      if (link && !link.matches(":disabled, [aria-disabled='true']") && (!rapid || card || pager)) {
         link.click();
         return;
       }
       if (browser.closest(".diffs-tree-drawer")) document.querySelector('[data-testid="file-tree-drawer-button"]')?.click();
       if (card && root.contains(card)) {
         card.scrollIntoView({ block: "start" });
+        return;
+      }
+      if (!rapid && file.hash && pager && location.hash !== `#${file.hash}`) {
+        // Classic listens for bare hash changes in its file-by-file view.
+        location.hash = file.hash;
         return;
       }
       const url = fileUrl(file, rapid);
@@ -640,6 +776,7 @@
       if (file) void openFile(file);
     });
     retry.addEventListener("click", () => void load());
+    if (rapid) root.addEventListener("DiffFileMounted", onDiffFileMounted);
     void load();
 
     return {
@@ -649,6 +786,8 @@
       dispose() {
         controller.abort();
         filterController?.abort();
+        resetClassicFilter();
+        root.removeEventListener("DiffFileMounted", onDiffFileMounted);
         clearVisibility();
         host.remove();
       },
@@ -661,7 +800,9 @@
 
   function update() {
     const context = reviewData.mergeRequestFromPath(location.pathname);
-    if (!context || !/\/diffs\/?$/.test(location.pathname)) {
+    const classicTabLink = context && new URLSearchParams(location.search).get("tab") === "diffs"
+      && location.pathname.replace(/\/$/, "") === reviewData.mergeRequestPath(context);
+    if (!context || (!/\/diffs\/?$/.test(location.pathname) && !classicTabLink)) {
       pageObserver.disconnect();
       active?.dispose();
       active = undefined;
@@ -669,7 +810,7 @@
     }
     pageObserver.observe(document.body, { childList: true, subtree: true });
     const rapid = document.querySelector(".merge-request [data-rapid-diffs]");
-    const root = rapid ?? document.querySelector(".merge-request #diffs.tab-pane");
+    const root = rapid ?? document.querySelector(".merge-request :is(#diffs, #js-diffs-app:has(.diff-files-holder))");
     const endpoint = root && metadataUrl(context, root, Boolean(rapid));
     if (active?.root === root && active.endpoint === endpoint?.href && active.isConnected()) return;
     active?.dispose();

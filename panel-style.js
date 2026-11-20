@@ -17,8 +17,8 @@ ownerFilterStyle.replaceSync(`
 
   .toolbar {
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
+    justify-content: flex-end;
     gap: 8px;
     padding: 8px 0;
     min-width: 0;
@@ -36,7 +36,7 @@ ownerFilterStyle.replaceSync(`
   }
 
   .control:hover, .option:hover { background: var(--raised); }
-  .picker-toggle { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .picker-toggle { flex: 0 0 auto; min-width: 0; max-width: min(60%, 240px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .picker-toggle::after { content: "▾"; margin-inline-start: 6px; }
 
   .options {
@@ -54,12 +54,12 @@ ownerFilterStyle.replaceSync(`
     box-shadow: 0 4px 12px light-dark(#1d263826, #0006);
   }
 
-  @supports (position-area: block-end span-inline-end) {
+  @supports (position-area: block-end span-inline-start) {
     .options {
       inset: auto;
-      margin: 4px;
-      position-area: block-end span-inline-end;
-      justify-self: start;
+      margin: 4px 0;
+      position-area: block-end span-inline-start;
+      justify-self: end;
       align-self: start;
       position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
     }
@@ -77,10 +77,21 @@ ownerFilterStyle.replaceSync(`
   }
 
   .option input { flex: 0 0 auto; margin: 3px 0 0; accent-color: var(--focus); }
+  .approval-marker {
+    flex: 0 0 10px;
+    height: 10px;
+    margin-block-start: 4px;
+    border: 1px solid light-dark(#595c65, #a3a5ab);
+    border-radius: 50%;
+    background: light-dark(#c4c5cb, #777981);
+  }
+  [data-approval="approved"] .approval-marker { background: light-dark(#1a7f37, #57ca7d); }
+  [data-approval="pending"] .approval-marker { background: light-dark(#c32232, #ff7c85); }
+  [data-approval="empty"] .approval-marker { background: #fff; }
   .reset { font: inherit; color: inherit; background: transparent; border: 0; text-align: start; }
   .reset[aria-pressed="true"] { background: var(--raised); font-weight: 600; }
-  .jump { width: min(340px, 100%); min-width: 0; }
-  .status { font-size: 12px; }
+  .jump { flex: 0 1 340px; width: 100%; min-width: 0; }
+  .status { margin-inline-end: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
   .status:empty { display: none; }
   .options-status { padding: 6px 8px; }
   [data-busy]::before {

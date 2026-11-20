@@ -16,6 +16,10 @@ const reviewData = (() => {
     return `/${project}/-/merge_requests/${context.iid}`;
   }
 
+  function projectApiPath(context) {
+    return `/api/v4/projects/${encodeURIComponent(context.project)}`;
+  }
+
   function normalizePattern(pattern) {
     if (pattern === "*") return "/**/*";
     pattern = pattern.replace(/^\\#/, "#").replace(/\\\s+/g, " ");
@@ -112,7 +116,7 @@ const reviewData = (() => {
   }
 
   async function loadSections(context, signal) {
-    const project = `/api/v4/projects/${encodeURIComponent(context.project)}`;
+    const project = projectApiPath(context);
     const endpoint = `${project}/merge_requests/${context.iid}`;
     const { target_branch: branch } = await (await request(endpoint, signal)).json();
     for (const path of codeownersPaths) {
@@ -121,6 +125,38 @@ const reviewData = (() => {
       if (response) return parseCodeowners(await response.text());
     }
     return [];
+  }
+
+  function approvalStatus(rules) {
+    const required = rules.filter(rule => rule.approvals_required > 0);
+    if (required.some(rule => rule.approved === false)) return "pending";
+    if (required.some(rule => rule.approved !== true)) return "unavailable";
+    if (required.length) {
+      const missingVotes = required.some(rule => Array.isArray(rule.approved_by)
+        && rule.approved_by.length < rule.approvals_required);
+      return missingVotes ? "satisfied" : "approved";
+    }
+    return rules.every(rule => Array.isArray(rule.approved_by) && rule.approved_by.length > 0)
+      ? "approved" : "optional";
+  }
+
+  async function loadApprovals(context, signal) {
+    const endpoint = `${projectApiPath(context)}/merge_requests/${context.iid}/approval_state`;
+    const { rules } = await (await request(endpoint, signal)).json();
+    if (!Array.isArray(rules)) throw new Error("GitLab не вернул правила апрува.");
+
+    const bySection = new Map();
+    for (const rule of rules) {
+      if (rule?.rule_type !== "code_owner" || typeof rule.section !== "string") continue;
+      const key = rule.section.trim().toLowerCase();
+      if (!bySection.has(key)) bySection.set(key, []);
+      bySection.get(key).push(rule);
+    }
+    const approvals = new Map();
+    for (const [key, entries] of bySection) approvals.set(key, approvalStatus(entries));
+    // GitLab calls the unnamed CODEOWNERS section "codeowners".
+    if (approvals.has("codeowners")) approvals.set("", approvals.get("codeowners"));
+    return approvals;
   }
 
   async function loadFiles(endpoint, signal) {
@@ -133,5 +169,5 @@ const reviewData = (() => {
     })).filter(file => typeof file.oldPath === "string" && typeof file.newPath === "string");
   }
 
-  return { mergeRequestFromPath, mergeRequestPath, fileSections, loadSections, loadFiles };
+  return { mergeRequestFromPath, mergeRequestPath, fileSections, loadSections, loadFiles, loadApprovals };
 })();

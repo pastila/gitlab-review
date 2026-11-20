@@ -2,6 +2,16 @@
   display: none !important;
 }
 
+.raketa-codeowners-tree[hidden] {
+  display: none !important;
+}
+
+/* Classic's virtual scroller ignores zero-sized items when updating their height. */
+.diff-files-holder .vue-recycle-scroller__item-view > :has(> .diff-file[data-raketa-codeowners-hidden]) {
+  min-height: 1px;
+  margin-block: 0 !important;
+}
+
 [data-raketa-codeowners-compact-tree] > :is(.mr-tree-list, [role="status"]) {
   display: none !important;
 }
