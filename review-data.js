@@ -1,8 +1,5 @@
 const reviewData = (() => {
   const codeownersPaths = ["CODEOWNERS", "docs/CODEOWNERS", ".gitlab/CODEOWNERS"];
-  const gitEscapes = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
   function mergeRequestFromPath(pathname) {
     const match = pathname.match(/^\/(.+?)\/-\/merge_requests\/([1-9]\d*)(?:\/|$)/);
@@ -12,6 +9,11 @@ const reviewData = (() => {
     } catch {
       return null;
     }
+  }
+
+  function mergeRequestPath(context) {
+    const project = context.project.split("/").map(encodeURIComponent).join("/");
+    return `/${project}/-/merge_requests/${context.iid}`;
   }
 
   function normalizePattern(pattern) {
@@ -94,87 +96,25 @@ const reviewData = (() => {
     return matched;
   }
 
-  function assignSections(files, sections) {
-    for (const file of files) {
-      const paths = file.oldPath === file.newPath ? [file.path] : [file.oldPath, file.newPath];
-      file.sections = sections.filter(section => paths.some(path => matchesPath(section, path)));
-    }
-  }
-
-  function decodeGitPath(path) {
-    if (!path.startsWith('"')) return path;
-    const bytes = [];
-    const chunks = path.slice(1, -1).matchAll(/\\([0-7]{3}|.)|[^\\]+/gs);
-    for (const [chunk, escape] of chunks) {
-      if (escape === undefined) {
-        for (const byte of encoder.encode(chunk)) bytes.push(byte);
-      } else {
-        bytes.push(gitEscapes[escape] ?? Number.parseInt(escape, 8));
-      }
-    }
-    return decoder.decode(Uint8Array.from(bytes));
-  }
-
-  function fileFromPatch(header, lines) {
-    let oldPath;
-    let newPath;
-    let status = "M";
-    let binary = false;
-    let changes = [];
-
-    for (const [index, line] of lines.entries()) {
-      if (line.startsWith("@@ ")) {
-        changes = changes.concat(lines.slice(index));
-        break;
-      }
-      if (line.startsWith("new file mode ")) status = "A";
-      if (line.startsWith("deleted file mode ")) status = "D";
-      if (line.startsWith("old mode ") || line.startsWith("new mode ")) changes.push(line);
-      const move = line.match(/^(rename|copy) (from|to) (.+)$/);
-      if (move) {
-        status = move[1] === "rename" ? "R" : "C";
-        if (move[2] === "from") oldPath = decodeGitPath(move[3]);
-        else newPath = decodeGitPath(move[3]);
-      }
-      if (line === "GIT binary patch" || line.startsWith("Binary files ")) {
-        binary = true;
-        break;
-      }
-    }
-
-    if (!oldPath || !newPath) {
-      // For files that were not moved, both paths in the header are identical.
-      const samePath = header.match(/^a\/(.*) b\/\1$/) ?? header.match(/^"a\/(.*)" "b\/\1"$/);
-      if (!samePath) throw new Error("Не удалось разобрать путь файла в diff GitLab.");
-      oldPath = newPath = header.startsWith('"') ? decodeGitPath(`"${samePath[1]}"`) : samePath[1];
-    }
-
-    return { oldPath, newPath, path: status === "D" ? oldPath : newPath, status, binary, changes };
-  }
-
-  function parseRawDiff(patch) {
-    if (!patch.trim()) return [];
-    const records = patch.split(/(?=^diff --git )/m);
-    if (!records[0].startsWith("diff --git ")) throw new Error("GitLab вернул ответ в неизвестном формате diff.");
-    return records.map(record => {
-      const lines = record.split("\n");
-      if (lines.at(-1) === "") lines.pop();
-      const header = lines.shift().slice("diff --git ".length);
-      return fileFromPatch(header, lines);
-    });
+  function fileSections(oldPath, newPath, sections) {
+    const paths = oldPath === newPath ? [newPath] : [oldPath, newPath];
+    return sections.filter(section => paths.some(path => matchesPath(section, path))).map(section => section.key);
   }
 
   async function request(path, signal, { allowMissing = false } = {}) {
     const response = await fetch(path, { credentials: "same-origin", cache: "no-store", signal });
+    if (allowMissing && response.status === 404 && !response.redirected) return null;
     if ([401, 403].includes(response.status) || response.redirected) {
       throw new Error("Войдите в GitLab и проверьте доступ к МР.");
     }
-    if (allowMissing && response.status === 404) return null;
     if (!response.ok) throw new Error(`GitLab вернул HTTP ${response.status}.`);
     return response;
   }
 
-  async function loadCodeowners(project, branch, signal) {
+  async function loadSections(context, signal) {
+    const project = `/api/v4/projects/${encodeURIComponent(context.project)}`;
+    const endpoint = `${project}/merge_requests/${context.iid}`;
+    const { target_branch: branch } = await (await request(endpoint, signal)).json();
     for (const path of codeownersPaths) {
       const url = `${project}/repository/files/${encodeURIComponent(path)}/raw?${new URLSearchParams({ ref: branch })}`;
       const response = await request(url, signal, { allowMissing: true });
@@ -183,22 +123,15 @@ const reviewData = (() => {
     return [];
   }
 
-  async function loadReview(context, signal) {
-    const project = `/api/v4/projects/${encodeURIComponent(context.project)}`;
-    const endpoint = `${project}/merge_requests/${context.iid}`;
-    const mr = await (await request(endpoint, signal)).json();
-    const [patch, sections] = await Promise.all([
-      request(`${endpoint}/raw_diffs`, signal).then(response => response.text()),
-      loadCodeowners(project, mr.target_branch, signal),
-    ]);
-
-    const files = parseRawDiff(patch);
-    assignSections(files, sections);
-    const expected = String(mr.changes_count ?? "");
-    const incomplete = (/^\d+$/.test(expected) && files.length !== Number(expected))
-      || (/^\d+\+$/.test(expected) && files.length <= Number.parseInt(expected, 10));
-    return { files, sections, incomplete, expected, targetBranch: mr.target_branch };
+  async function loadFiles(endpoint, signal) {
+    const { diff_files: files } = await (await request(endpoint, signal)).json();
+    if (!Array.isArray(files)) throw new Error("GitLab не вернул список файлов.");
+    return files.map(file => ({
+      oldPath: file.old_path,
+      newPath: file.new_path,
+      hash: file.file_hash,
+    })).filter(file => typeof file.oldPath === "string" && typeof file.newPath === "string");
   }
 
-  return { mergeRequestFromPath, parseCodeowners, assignSections, parseRawDiff, loadReview };
+  return { mergeRequestFromPath, mergeRequestPath, fileSections, loadSections, loadFiles };
 })();
