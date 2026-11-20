@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Файлы команды в GitLab",
+  "description": "Фильтр изменений merge request по секциям CODEOWNERS на raketa.dev.",
+  "version": "0.1.0",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["https://raketa.dev/*"],
+      "js": ["review-data.js", "panel-style.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
