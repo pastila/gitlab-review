@@ -128,7 +128,7 @@
     const shadow = host.attachShadow({ mode: "open" });
     shadow.adoptedStyleSheets = [ownerFilterStyle];
     const nav = element("nav", "file-tree");
-    nav.setAttribute("aria-label", "Файлы выбранных секций CODEOWNERS");
+    nav.setAttribute("aria-label", "Файлы по активным фильтрам");
     shadow.append(nav);
     browser.append(host);
 
@@ -292,20 +292,24 @@
     shadow.adoptedStyleSheets = [ownerFilterStyle];
 
     const toolbar = element("section", "toolbar");
-    toolbar.setAttribute("aria-label", "Фильтр CODEOWNERS");
+    toolbar.setAttribute("aria-label", "Фильтры файлов");
     const picker = button("control picker-toggle", "CODEOWNERS");
     const options = element("div", "options");
     options.id = "raketa-codeowners-options";
     options.popover = "auto";
     picker.setAttribute("popovertarget", options.id);
     options.setAttribute("role", "group");
-    options.setAttribute("aria-label", "Секции CODEOWNERS");
+    options.setAttribute("aria-label", "Фильтры файлов");
     const optionsStatus = element("div", "options-status");
     options.append(optionsStatus);
     const reset = button("option reset", "Все файлы");
+    const hideFeaturesOption = element("label", "option");
+    const hideFeatures = element("input");
+    hideFeatures.type = "checkbox";
+    hideFeaturesOption.append(hideFeatures, element("span", "", "Скрыть файлы .feature"));
 
     const jump = element("select", "control jump");
-    jump.setAttribute("aria-label", "Перейти к файлу из выбранных секций");
+    jump.setAttribute("aria-label", "Перейти к файлу");
     jump.hidden = true;
     const status = element("span", "status");
     status.setAttribute("role", "status");
@@ -318,6 +322,7 @@
     else root.prepend(host);
 
     const storageKey = `codeowners-section:${context.project}`;
+    const hideFeaturesKey = `codeowners-hide-feature-files:${context.project}`;
     const selected = new Set();
     const cardsSelector = rapid ? "diff-file[data-file-data]" : ".diff-file[data-path]";
     const pagerSelector = '[data-testid="file-by-file-navigation"]';
@@ -341,6 +346,7 @@
     let approvalRequest;
     let filterController;
     let appliedSections = new Set();
+    let appliedHideFeatures = false;
     let filesToExpand = new Set();
     let classicFiltered = false;
     let frame;
@@ -371,8 +377,13 @@
       };
     }
 
+    function hasActiveFilter() {
+      return appliedSections.size > 0 || appliedHideFeatures;
+    }
+
     function matches(file) {
-      return file.owners.some(key => appliedSections.has(key));
+      if (appliedHideFeatures && (file.oldPath.endsWith(".feature") || file.newPath.endsWith(".feature"))) return false;
+      return !appliedSections.size || file.owners.some(key => appliedSections.has(key));
     }
 
     function setHidden(node, hidden) {
@@ -479,7 +490,7 @@
         pendingNodes.clear();
         if (treesDirty) {
           treesDirty = false;
-          if (appliedSections.size) void syncTrees().catch(() => {});
+          if (hasActiveFilter()) void syncTrees().catch(() => {});
         }
       });
     }
@@ -522,7 +533,7 @@
     }
 
     function applyVisibility() {
-      if (!appliedSections.size) {
+      if (!hasActiveFilter()) {
         clearVisibility();
         return;
       }
@@ -547,12 +558,13 @@
       const names = sections.filter(({ key }) => selected.has(key)).map(({ label }) => label);
       picker.textContent = names.length === 1 ? `CODEOWNERS · ${names[0]}` : "CODEOWNERS";
       if (names.length > 1) picker.textContent += ` · ${names.length}`;
+      if (hideFeatures.checked) names.push("Файлы .feature скрыты");
       picker.title = names.join(", ");
-      reset.setAttribute("aria-pressed", String(!selected.size));
+      reset.setAttribute("aria-pressed", String(!selected.size && !hideFeatures.checked));
     }
 
     async function renderJump(signal) {
-      if (!appliedSections.size || !visibleFiles.length) {
+      if (!hasActiveFilter() || !visibleFiles.length) {
         jump.hidden = true;
         return;
       }
@@ -585,11 +597,13 @@
     async function renderSelection(signal) {
       signal.throwIfAborted();
       appliedSections = new Set(selected);
-      const nextFiles = appliedSections.size ? files.filter(matches) : files;
+      appliedHideFeatures = hideFeatures.checked;
+      const filtering = hasActiveFilter();
+      const nextFiles = filtering ? files.filter(matches) : files;
       if (visibleFiles.length !== nextFiles.length || nextFiles.some((file, index) => file !== visibleFiles[index])) {
         visibleFiles = nextFiles;
       }
-      if (appliedSections.size) {
+      if (filtering) {
         filesToExpand = new Set(visibleFiles.slice(0, autoExpandLimit));
         if (!rapid) {
           const detail = visibleFiles.map(({ hash, newPath }) => ({ hash, newPath }));
@@ -601,14 +615,14 @@
         resetClassicFilter();
       }
       applyVisibility();
-      await Promise.all([renderJump(signal), appliedSections.size ? syncTrees() : undefined]);
+      await Promise.all([renderJump(signal), filtering ? syncTrees() : undefined]);
       signal.throwIfAborted();
 
-      let message = "";
-      if (appliedSections.size) {
+      let message = sections.length ? "" : "В целевой ветке нет правил CODEOWNERS.";
+      if (filtering) {
         message = visibleFiles.length
           ? `Файлы · ${visibleFiles.length} из ${files.length}`
-          : "Файлов в выбранных секциях нет.";
+          : "Нет файлов, подходящих под фильтры.";
       }
       showStatus(message);
     }
@@ -625,9 +639,8 @@
       });
     }
 
-    function saveSelection() {
-      const values = [...selected];
-      save = save.then(() => chrome.storage.local.set({ [storageKey]: values })).catch(() => {});
+    function savePreferences(preferences) {
+      save = save.then(() => chrome.storage.local.set(preferences)).catch(() => {});
       requestFilter();
     }
 
@@ -686,13 +699,9 @@
       }, signal);
       signal.throwIfAborted();
       ready = true;
-      if (sections.length) options.replaceChildren(optionsStatus, reset, labelsWithFiles, labelsWithoutFiles);
+      options.replaceChildren(optionsStatus, reset, hideFeaturesOption, labelsWithFiles, labelsWithoutFiles);
       if (options.matches(":popover-open")) void refreshApprovals();
-      if (selected.size) requestFilter();
-      else {
-        updatePicker();
-        showStatus(sections.length ? "" : "В целевой ветке нет правил CODEOWNERS.");
-      }
+      requestFilter();
     }
 
     async function load() {
@@ -706,7 +715,7 @@
         const [rules, entries, stored] = await Promise.all([
           reviewData.loadSections(context, current.signal),
           reviewData.loadFiles(endpoint, current.signal),
-          chrome.storage.local.get(storageKey).catch(() => ({})),
+          chrome.storage.local.get([storageKey, hideFeaturesKey]).catch(() => ({})),
         ]);
         if (current.signal.aborted) return;
         sections = rules;
@@ -717,6 +726,7 @@
         filesByHash = new Map(files.filter(file => file.hash).map(file => [file.hash, file]));
         if (rapid) filesByPaths = new Map(files.map(file => [pathsKey(file), file]));
         else filesByNewPath = new Map(files.map(file => [file.newPath, file]));
+        hideFeatures.checked = stored[hideFeaturesKey] === true;
         await renderOptions(stored[storageKey], current.signal);
       } catch (error) {
         if (current.signal.aborted) return;
@@ -727,9 +737,13 @@
 
     options.addEventListener("change", event => {
       const input = event.target;
+      if (input === hideFeatures) {
+        savePreferences({ [hideFeaturesKey]: hideFeatures.checked });
+        return;
+      }
       if (input.checked) selected.add(input.value);
       else selected.delete(input.value);
-      saveSelection();
+      savePreferences({ [storageKey]: [...selected] });
     });
     options.addEventListener("toggle", event => {
       if (event.newState === "open") void refreshApprovals();
@@ -739,10 +753,10 @@
       if (next && next !== picker && !options.contains(next) && options.matches(":popover-open")) options.hidePopover();
     });
     reset.addEventListener("click", () => {
-      if (!selected.size) return;
+      if (!selected.size && !hideFeatures.checked) return;
       selected.clear();
       for (const input of options.querySelectorAll("input:checked")) input.checked = false;
-      saveSelection();
+      savePreferences({ [storageKey]: [], [hideFeaturesKey]: false });
     });
     async function openFile(file, browser = root) {
       const card = (file.hash && document.getElementById(file.hash))
